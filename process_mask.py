@@ -10,6 +10,9 @@ import scipy.ndimage
 import scipy.misc
 import floodfill
 
+DEBUG = os.getenv("DEBUG")
+eight_way = os.getenv("EIGHT_WAY", default=True)
+
 class Img:
     def __init__(self, data, path):
         self.data = data
@@ -25,15 +28,19 @@ def img_from_file(path):
     data = np.array(Image.open(path))
     return Img(data, path)
 
-def to_binary(img, lower, upper):
-    return (lower < img) & (img < upper)
+def to_binary(img, lower, upper, reverse=False):
+    return reverse ^ ((lower < img) & (img < upper))
 
 def insert_postfix(path, postfix):
     index = path.rfind('.')
     return ''.join([path[:index], '_', postfix, path[index:]])
 
-def make_binary(img):
-    bin_data = 1.0 * to_binary(img.data, 20000, 70000)
+def make_binary(img, lower_threshold=20000, upper_threshold=70000,
+        reverse=False):
+    bin_data = 1.0 * to_binary(img.data, lower_threshold, upper_threshold,
+            reverse)
+    if os.getenv("DEBUG") != None:
+        print(bin_data)
     bin_path = insert_postfix(img.path, 'bin')
     bin_img = Img(bin_data, bin_path)
     bin_img.store()
@@ -46,12 +53,130 @@ def edge_fill(img):
     filled_img.store()
     return filled_img
 
-def point_fill(img, points):
-    filled_data = floodfill.from_points(img.data, points)
-    filled_path = insert_postfix(img.path, 'points-filled')
-    filled_img = Img(filled_data, filled_path)
-    filled_img.store()
-    return filled_img
+def get_points_with_given_value_from_img_data(data, value):
+    points = []
+    rows = data.shape[0]
+    cols = data.shape[1]
+    for x in range(0, rows):
+        for y in range(0, cols):
+            if data[x,y] == value:
+                points.append([x,y])
+    return points
+
+def get_first_point_with_given_value(data, value):
+    rows = data.shape[0]
+    cols = data.shape[1]
+    for x in range(0, rows):
+        for y in range(0, cols):
+            if data[x,y] == value:
+                return [x,y]
+    return None
+
+def taint_point(data,x,y, eight_way=True):
+    ## edge cases: out of bound, so we don't need to worry elsewhere
+    if x < 0 or y < 0 or x >= data.shape[0] or y >= data.shape[1]:
+        return
+    ## recursion: if 1 or 0.5, return
+    if data[x,y] == 1 or data[x,y] == 0.5:
+        return
+    ## only other case is 0, set to 0.5
+    data[x,y] = 0.5
+    ## call all 8 neighbors
+    taint_point(data, x-1,y)
+    taint_point(data, x,y+1)
+    taint_point(data, x+1,y)
+    taint_point(data, x,y-1)
+    if eight_way:
+        taint_point(data, x-1,y+1)
+        taint_point(data, x+1,y+1)
+        taint_point(data, x+1,y-1)
+        taint_point(data, x-1,y-1)
+
+def remove_marked_regions(data, marks, look_around_distance=10):
+    if DEBUG:
+        print('received following data:\n', data)
+        print('... and following mask:\n', marks)
+    # iterate through marks
+    points = get_points_with_given_value_from_img_data(marks, 0)
+    # change value of all regions which are touched by or close to marks from 0 to 0.5
+    for point in points:
+        # get coordinates of point
+        x, y = point[0], point[1]
+        # if already 0.5, move on
+        if data[x,y] == 0.5:
+            continue
+        # if 1, look around at all neighbors (as far as look_around_distance)
+        if data[x,y] != marks[x,y]:
+            bigger_window = data[0:30, 0:20]
+            look_around_window_x_min = max(0,x-look_around_distance)
+            look_around_window_x_max = min(data.shape[0]-1,x+look_around_distance)
+            look_around_window_y_min = max(0,y-look_around_distance)
+            look_around_window_y_max = min(data.shape[1]-1,y+look_around_distance)
+            if DEBUG:
+                print('look around corners:', [look_around_window_x_min,
+                        look_around_window_y_min],
+                        [look_around_window_x_max,
+                        look_around_window_y_max])
+            look_around_window = \
+                    data[look_around_window_x_min:look_around_window_x_max,
+                    look_around_window_y_min:look_around_window_y_max]
+            if DEBUG:
+                print('point coordinates:', point)
+                print("data:", data[x,y])
+                print("mark:", marks[x,y])
+                print("bigger window:\n", bigger_window)
+                print('look around window:\n', look_around_window)
+            actual_point_relative = get_first_point_with_given_value(look_around_window,
+                    marks[x,y])
+            # if nothing found, print warning and continue
+            if actual_point_relative == None:
+                print("No point with value %f found around [%d, %d] with look "+
+                "around distance %d, continuing" % marks[x,y], x, y, look_around_distance)
+                continue
+            actual_point = [
+                    max(0,x-10) + actual_point_relative[0],
+                    max(0,y-10) + actual_point_relative[1]
+                    ]
+            if DEBUG:
+                print('relative coordinates to actual point:',
+                        actual_point_relative)
+                print('calculated absolute coordinates to actual point:',
+                        actual_point)
+                print('value (should be 0) at calculated abs coord to actual '+
+                        'point:', data[actual_point[0],
+                            actual_point[1]])
+            x = actual_point[0]
+            y = actual_point[1]
+        # if 0, start recursion
+        taint_point(data,x,y,eight_way)
+    if DEBUG:
+        print('processed data:\n', data)
+    # filter out all the unmarked 0.0 regions and convert back to 0
+    unmarked = (data < 0.1).astype(int)
+    data += unmarked
+    if DEBUG:
+        print('removed unmarked 0 regions:\n', data)
+    # convert all 0.5 regions back to 0.0 regions
+    data = 1 * (0.6 < data)
+    if DEBUG:
+        print('converted marked regions back to 0:\n', data)
+    np.set_printoptions(edgeitems=200)
+    if DEBUG:
+        print('final result:\n', data)
+    return data
+
+def filter_image(img, mask):
+    look_around_distance_string = os.getenv("LOOK_AROUND_DIST", "10")
+    look_around_distance = int(look_around_distance_string)
+    img_bin = img.data/255
+    mask_bin = np.average(mask.data, 2)/255
+    filtered_data = remove_marked_regions(img_bin, mask_bin,
+        look_around_distance)
+    filtered_path = insert_postfix(img.path,
+        'filtered_'+look_around_distance_string)
+    filtered_img = Img(filtered_data, filtered_path)
+    filtered_img.store()
+    return filtered_img
 
 def fill_binary(img):
     filled_data = 1.0 * scipy.ndimage.morphology.binary_fill_holes(img.data)
@@ -62,11 +187,49 @@ def fill_binary(img):
 
 def main():
     os.putenv("DISPLAY", ":0.0")
+    if DEBUG:
+        np.set_printoptions(edgeitems=200)
     data_dir = os.path.join(os.path.curdir, 'data')
-    mask_filename = '*_mask_all.tif'
-    for filepath in glob.glob(os.path.join(data_dir, mask_filename)):
-        img = img_from_file(filepath)
-        img_bin = make_binary(img)
+
+    mask_glob = '*_mask_all_bin_resized.tif'
+    for mask_path in glob.glob(os.path.join(data_dir, mask_glob)):
+        mask = img_from_file(mask_path)
+        make_binary(mask, lower_threshold=100, upper_threshold=260)
+
+    mask_glob = '1_mask_all_bin_resized_bin.tif'
+    for mask_path in glob.glob(os.path.join(data_dir, mask_glob)):
+        mask = img_from_file(mask_path)
+        annotation_glob = (os.path.basename(mask_path).split('_')[0] +
+                '*filtered_bin.tif')
+        annotation_path = glob.glob(os.path.join(data_dir, annotation_glob))[0]
+        annotation = img_from_file(annotation_path)
+        final_mask = filter_image(mask, annotation)
+
+def test():
+    data = np.array([
+        [1.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0, 0.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+    ])
+    mask = np.array([
+        [1.0, 1.0, 1.0, 1.0, 1.0, 0.0],
+        [1.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 0.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    ])
+    remove_marked_regions(data,mask)
 
 if __name__ == "__main__":
     main()
+    #test()
